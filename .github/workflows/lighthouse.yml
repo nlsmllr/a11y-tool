@@ -17,15 +17,19 @@ on:
 jobs:
   generate_lighthouse_audit:
     timeout-minutes: 30
-    runs-on: ubuntu-latest-4cores-16gb
+    runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Wait for the Vercel deployment
         uses: patrickedqvist/wait-for-vercel-preview@v1.3.1
         id: wait_for_deployment
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          environment: Preview – protofy-website-next # Name of the Vercel environment
+          environment: Preview # Ensure this matches exactly with Vercel's environment name
           max_timeout: 1200
+
       - name: Add comment to PR
         id: loading_comment_to_pr
         uses: marocchino/sticky-pull-request-comment@v2.9.0
@@ -35,6 +39,7 @@ jobs:
           header: lighthouse
           message: |
             Running Lighthouse audit...
+
       - name: Audit preview build with Lighthouse
         id: lighthouse_audit
         uses: treosh/lighthouse-ci-action@v11
@@ -42,75 +47,94 @@ jobs:
           LHCI_BUILD_CONTEXT__CURRENT_HASH: ${{ github.sha }}
         with:
           urls: |
-            ${{ steps.wait_for_deployment.outputs.url }}/de
-            ${{ steps.wait_for_deployment.outputs.url }}/de/projects
-            ${{ steps.wait_for_deployment.outputs.url }}/de/projects/tchibo
-            ${{ steps.wait_for_deployment.outputs.url }}/de/services
-            ${{ steps.wait_for_deployment.outputs.url }}/de/blog
-            ${{ steps.wait_for_deployment.outputs.url }}/de/blog/coden-wie-ein-maedchen
-            ${{ steps.wait_for_deployment.outputs.url }}/de/press
-            ${{ steps.wait_for_deployment.outputs.url }}/de/career
-            ${{ steps.wait_for_deployment.outputs.url }}/de/contact
-            ${{ steps.wait_for_deployment.outputs.url }}/de/contact/moritz-mann
+            ${{ steps.wait_for_deployment.outputs.url }}
           runs: 3 # run 3 times for consistency
           uploadArtifacts: true
           temporaryPublicStorage: true
-      - name: Format Lighthouse score
-        id: format_lighthouse_score
-        continue-on-error: true
-        uses: actions/github-script@v7.0.1
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          result-encoding: string
-          script: |
-            const results = ${{ steps.lighthouse_audit.outputs.manifest }}
-            const representativeResults = results.filter(result => result.isRepresentativeRun)
-            const links = ${{ steps.lighthouse_audit.outputs.links }}
 
-            const comment = ['⚡️ Lighthouse Report for the changes in this PR:', ' ']
+      - name: Extract and format Lighthouse details
+        id: format_lighthouse_details
+        run: |
+          # Load the detailed JSON report
+          REPORT_PATH=$(find .lighthouseci -name "*.report.json" | head -n 1)
+          HTML_REPORT_PATH=$(find .lighthouseci -name "*.report.html" | head -n 1)
+          if [ -f "$REPORT_PATH" ]; then
+            REPORT_CONTENT=$(cat "$REPORT_PATH")
 
-            for (let i = 0; i < representativeResults.length; i++) {
-                const result = representativeResults[i].summary
-                const formatResult = (res) => Math.round((res * 100))
-                Object.keys(result).forEach(key => result[key] = formatResult(result[key]))
-                
-                const score = res => res >= 90 ? '🟢' : res >= 50 ? '🟠' : '🔴'
-                
-                comment.push(
-                    '---',
-                    `Results for [${Object.keys(links)[i]}](${Object.keys(links)[i]}):`,
-                    '| Category | Score |',
-                    '| --- | --- |',
-                    `| ${score(result.performance)} Performance | ${result.performance} |`,
-                    `| ${score(result.accessibility)} Accessibility | ${result.accessibility} |`,
-                    `| ${score(result['best-practices'])} Best practices | ${result['best-practices']} |`,
-                    `| ${score(result.seo)} SEO | ${result.seo} |`,
-                    ' ',
-                    `*Detailed Report: [Lighthouse report](${Object.values(links)[i]})*`,
-                    ' ',
-                )
-            }
+            # Parse failing audits and include titles where relevant elements exist
+            FAILING_AUDITS=$(echo "$REPORT_CONTENT" | jq -r '.audits | to_entries | map(select(.value.score != 1 and .value.details and .value.details.items)) | map(select(.value.details.items | map(.node.snippet // "No element data") | map(select(. != "No element data")) | length > 0) | ("**" + .value.title + "**: " + .value.description + "\nNeeds your attention: \n" + (.value.details.items | map(.node.snippet // "") | join("\n")))) | join("\n\n")')
 
-            const output = comment.join('\n')
-            return output
-      - name: Report error to PR
-        id: report_error_to_pr
-        if: ${{ steps.format_lighthouse_score.outcome != 'success' }}
-        uses: marocchino/sticky-pull-request-comment@v2.9.0
-        with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          number: ${{ github.event.pull_request.number }}
-          header: lighthouse
-          message: |
-            Error while running Lighthouse audit:
-            ${{ steps.format_lighthouse_score.outputs.result }}
+            # Default message if no issues
+            if [ -z "$FAILING_AUDITS" ]; then
+              FAILING_AUDITS="No failing accessibility issues detected."
+            fi
+
+            # Extract scores
+            PERFORMANCE_SCORE=$(echo "$REPORT_CONTENT" | jq -r '.categories.performance.score * 100 | floor')
+            ACCESSIBILITY_SCORE=$(echo "$REPORT_CONTENT" | jq -r '.categories.accessibility.score * 100 | floor')
+            BEST_PRACTICES_SCORE=$(echo "$REPORT_CONTENT" | jq -r '.categories["best-practices"].score * 100 | floor')
+            SEO_SCORE=$(echo "$REPORT_CONTENT" | jq -r '.categories.seo.score * 100 | floor')
+
+            # Assign colors based on score thresholds
+            PERFORMANCE_COLOR=$(if [ $PERFORMANCE_SCORE -ge 90 ]; then echo "🟢"; elif [ $PERFORMANCE_SCORE -ge 50 ]; then echo "🟠"; else echo "🔴"; fi)
+            ACCESSIBILITY_COLOR=$(if [ $ACCESSIBILITY_SCORE -ge 90 ]; then echo "🟢"; elif [ $ACCESSIBILITY_SCORE -ge 50 ]; then echo "🟠"; else echo "🔴"; fi)
+            BEST_PRACTICES_COLOR=$(if [ $BEST_PRACTICES_SCORE -ge 90 ]; then echo "🟢"; elif [ $BEST_PRACTICES_SCORE -ge 50 ]; then echo "🟠"; else echo "🔴"; fi)
+            SEO_COLOR=$(if [ $SEO_SCORE -ge 90 ]; then echo "🟢"; elif [ $SEO_SCORE -ge 50 ]; then echo "🟠"; else echo "🔴"; fi)
+
+            # Set report link
+            if [ -f "$HTML_REPORT_PATH" ]; then
+              REPORT_LINK="https://storage.googleapis.com/${{ github.repository }}/$HTML_REPORT_PATH"
+            else
+              REPORT_LINK="#"
+            fi
+          else
+            FAILING_AUDITS="Lighthouse report not found."
+            PERFORMANCE_SCORE="N/A"
+            ACCESSIBILITY_SCORE="N/A"
+            BEST_PRACTICES_SCORE="N/A"
+            SEO_SCORE="N/A"
+            PERFORMANCE_COLOR="🔴"
+            ACCESSIBILITY_COLOR="🔴"
+            BEST_PRACTICES_COLOR="🔴"
+            SEO_COLOR="🔴"
+            REPORT_LINK="#"
+          fi
+
+          # Save the output to a GitHub Actions output variable
+          echo "formatted_audits<<EOF" >> $GITHUB_ENV
+          echo "$FAILING_AUDITS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "performance_score=$PERFORMANCE_SCORE" >> $GITHUB_ENV
+          echo "accessibility_score=$ACCESSIBILITY_SCORE" >> $GITHUB_ENV
+          echo "best_practices_score=$BEST_PRACTICES_SCORE" >> $GITHUB_ENV
+          echo "seo_score=$SEO_SCORE" >> $GITHUB_ENV
+          echo "performance_color=$PERFORMANCE_COLOR" >> $GITHUB_ENV
+          echo "accessibility_color=$ACCESSIBILITY_COLOR" >> $GITHUB_ENV
+          echo "best_practices_color=$BEST_PRACTICES_COLOR" >> $GITHUB_ENV
+          echo "seo_color=$SEO_COLOR" >> $GITHUB_ENV
+          echo "report_link=$REPORT_LINK" >> $GITHUB_ENV
+
       - name: Add results to PR
         id: results_to_pr
-        if: ${{ steps.format_lighthouse_score.outcome == 'success' }}
         uses: marocchino/sticky-pull-request-comment@v2.9.0
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           number: ${{ github.event.pull_request.number }}
           header: lighthouse
           message: |
-            ${{ steps.format_lighthouse_score.outputs.result }}
+            Lighthouse Report this Pull Request:
+
+            | Category         | Score |
+            | ---------------- | ----- |
+            | ${{ env.performance_color }} Performance    | ${{ env.performance_score }} |
+            | ${{ env.accessibility_color }} Accessibility | ${{ env.accessibility_score }} |
+            | ${{ env.best_practices_color }} Best Practices | ${{ env.best_practices_score }} |
+            | ${{ env.seo_color }} SEO           | ${{ env.seo_score }} |
+
+            **Accessibility Failures:**
+
+            ´´´
+            ${{ env.formatted_audits }}
+            ´´´
+
+            *Detailed Report: [Lighthouse report](${{ env.report_link }})*
